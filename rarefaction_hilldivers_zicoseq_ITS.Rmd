@@ -1,0 +1,1582 @@
+---
+title: "BECROPS Pine Data - Compositional Data"
+author: "Sergio Diez Hermano"
+date: '`r format(Sys.Date(),"%e de %B, %Y")`'
+output:
+  html_document:
+      highlight: tango
+      code_folding: show
+      toc: yes
+      toc_depth: 4
+      toc_float:
+        collapsed: yes
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+# include this code chunk as-is to set options
+opts_chunk$set(comment = NA, prompt = FALSE, fig.height = 5, fig.width = 5, dpi = 300, fig.align = "center", 
+               message = FALSE, warning = FALSE, cache = FALSE, verbose = FALSE)
+# Sys.setenv(RSTUDIO_PANDOC = "C:/Program Files/Pandoc")
+Sys.setlocale("LC_TIME", "C")
+```
+
+# Libraries and functions
+
+```{r}
+suppressMessages(library("biomformat"))
+suppressMessages(library("tidyr"))      # reshape to long format
+suppressMessages(library("pbapply"))
+suppressMessages(library("doParallel")) # parallel computing
+suppressMessages(library("parallel"))   # parallel computing
+suppressMessages(library("dplyr"))      # aggregate counts by taxa
+suppressMessages(library("tidyverse"))  # column to row names
+suppressMessages(library("openxlsx"))   # create a new Workbook object
+suppressMessages(library("xlsx"))       # create a new Workbook object
+suppressMessages(library("ggplot2"))
+suppressMessages(library("plotrix"))       # draw.circles
+suppressMessages(library("ggVennDiagram")) # show in R and fills with color gradient
+suppressMessages(library("VennDiagram"))   # don't show directly in R and changes circle size with shared data
+suppressMessages(library("ggplotify"))     # grid2grob
+suppressMessages(library("ggpubr"))        # ggarrange
+suppressMessages(library("viridis"))
+
+#######################
+# Rarefaction curves
+suppressMessages(library("vegan"))
+
+#######################
+# Hill diversity
+suppressMessages(library("MeanRarity"))
+
+#######################
+# CODA using ZicoSeq
+suppressMessages(library("GUniFrac"))
+
+######################
+# Phylogeny trees
+suppressMessages(library("metacoder"))
+
+######################################################################
+# Function to find minimum reads to convert relative to raw abundances
+
+getMin <- function(column, candidates, tol) {
+  # Each candidate times vector of relative abundances
+  cand.rel <- sapply(candidates, function(x) column*x)
+  # Check if generated numbers are integers to a certain tolerance value
+  cand.int <- apply(cand.rel, 2, 
+                    function(x) sapply(x, 
+                                       function(i) min(abs(c(i%%1, i%%1-1))) < 1e-1))
+  # Get first candidate that generate an all integers vector
+  cand.check <- candidates[which(colSums(cand.int) == length(column))[1]]
+  
+}
+
+####################################################
+# Function to extract taxa ranks from taxonomy list
+taxaGet <- function(taxaname, taxranks) {
+  taxavec <- character()
+  for (i in taxranks) {
+    if (i %in% taxaname$rank) {
+      taxavec[i] <- taxaname[taxaname$rank == i, 1]
+    } else {
+      taxavec[i] <- NA
+    }
+  }
+  return(taxavec)
+}
+
+########################################
+# Function to get color labels for dendrogram
+colLab <- function(n) {
+  if (is.leaf(n)) {
+    a <- attributes(n)
+    #labCol <- labelColors[clusMember[which(names(clusMember) == a$label)]]
+    labCol <- if (grepl("D", a$label) == TRUE ) "orange" else "skyblue"
+    attr(n, "nodePar") <- c(a$nodePar, lab.col = labCol)
+  }
+  n
+}
+
+########################################
+# Estimate intersection between two circles
+circle_intersection <- function(x1, y1, r1, x2, y2, r2){
+  rr1 <- r1 * r1
+  rr2 <- r2 * r2
+  d <- sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1))
+  
+  if (d > r2 + r1) # Circles do not overlap
+  {
+    return(0)
+  } else if (d <= abs(r1 - r2) && r1 >= r2){ # Circle2 is completely inside circle1  
+    return(pi*rr2)
+  } else if (d <= abs(r1 - r2) && r1 < r2){ # Circle1 is completely inside circle2
+    return(pi*rr1)
+  } else { # Circles partially overlap
+    phi <- (acos((rr1 + (d * d) - rr2) / (2 * r1 * d))) * 2
+    theta <- (acos((rr2 + (d * d) - rr1) / (2 * r2 * d))) * 2
+    area2 <- 0.5 * theta * rr2 - 0.5 * rr2 * sin(theta)
+    area1 <- 0.5 * phi * rr1 - 0.5 * rr1 * sin(phi)
+    return(area1 + area2)
+  }
+}
+```
+
+# Load data
+
+```{r}
+# Tree data
+tree.raw <- read.csv("../data/tree_abun.csv", row.names = 1)
+tree.taxa <- read.csv("../data/tree_taxa.csv", row.names = 1)
+origin.names <- colnames(tree.raw)
+colnames(tree.raw) <- paste0(rep("T", ncol(tree.raw)), origin.names)
+
+# Soil data
+soil.raw <- read.csv("../data/soil_abun.csv", row.names = 1)
+soil.taxa <- read.csv("../data/soil_taxa.csv", row.names = 1)
+soil.taxa <- apply(soil.taxa, 2, 
+                   function(x) sapply(x, 
+                                      function(y) ifelse(grepl("Incertae_sedis", y) == T,
+                                                         stringr::str_extract(y, "[^_]+"),
+                                                         y))) %>% 
+                     as.data.frame
+
+sapply(soil.taxa$class, function(y) if (grepl("Incertae_sedis", y) == T) stringr::str_extract(y, "[^_]+") else y)
+
+colnames(soil.raw) <- paste0(rep("S", ncol(tree.raw)),origin.names)
+
+# Meta data
+meta.data <- read.csv("../data/lifemeta.csv", row.names = 1)
+meta.data$UVAshort <- paste0(substr(meta.data$Type, 1, 1), meta.data$UVAshort)
+meta.data$Condition <- gsub("Disease", "Declining", meta.data$Condition)
+```
+
+# Set taxonomic resolution
+
+## Tree
+
+```{r}
+# Select taxonomic level (lowercase)
+taxalev <- "genus"
+
+if (taxalev != "species") {
+  
+  datadup <- tree.raw
+  datadup$taxa <- tree.taxa[, taxalev]
+  tree.res <- datadup %>% group_by(taxa) %>% summarise(across(everything(), sum)) %>% as.data.frame()
+  # tree.res[is.na(tree.res$taxa), "taxa"] <- "unidentified"
+  tree.res <- tree.res[-which(tree.res$taxa == "unidentified"), ]
+  rownames(tree.res) <- tree.res$taxa
+  tree.res <- subset(tree.res, select = -taxa)
+  colnames(tree.res) <- meta.data[meta.data$Type == "Tree", "UVAshort"]
+  rm(datadup)
+  
+}
+
+# Get taxonomy
+taxcats <- colnames(tree.taxa)
+taxo.step <- sapply(rownames(tree.res), function(x) tree.taxa[which(tree.taxa$genus == x)[1],] %>% as.character)
+rownames(taxo.step) <- taxcats
+taxo.step <- taxo.step[-dim(taxo.step)[1], ] %>% t() %>% as.data.frame()
+
+taxonlist <- list()
+
+for (i in taxcats[1:which(taxcats == taxalev)]) {
+
+  taxonlist[[i]] <- sapply(taxo.step[, i], function(x) paste(substr(i, 1, 1), "__", x, sep=""))
+
+}
+
+taxonframe <- do.call(cbind, taxonlist) %>% as.data.frame(., row.names = rownames(tree.taxa))
+tree.taxmap <- tree.res
+colnames(tree.taxmap) <- meta.data[meta.data$Type == "Tree", "UVAshort"]
+tree.taxmap$taxonomy <- apply(taxonframe, 1, function(x) paste("r__Root", paste(x, collapse=";"), sep=";"))
+tree.taxmap <- cbind(tree.taxmap, taxo.step)
+
+```
+
+## Soil
+
+```{r}
+# Select taxonomic level (lowercase)
+taxalev <- "genus"
+
+if (taxalev != "species") {
+  
+  datadup <- soil.raw
+  datadup$taxa <- soil.taxa[, taxalev]
+  soil.res <- datadup %>% group_by(taxa) %>% summarise(across(everything(), sum)) %>% as.data.frame()
+  # soil.res[is.na(soil.res$taxa), "taxa"] <- "unidentified"
+  soil.res <- soil.res[-which(soil.res$taxa == "unidentified"), ]
+  rownames(soil.res) <- soil.res$taxa
+  soil.res <- subset(soil.res, select = -taxa)
+  colnames(soil.res) <- meta.data[meta.data$Type == "Soil", "UVAshort"]
+  rm(datadup)
+  
+}
+
+# Get taxonomy
+taxcats <- colnames(soil.taxa)
+taxo.step <- sapply(rownames(soil.res), function(x) soil.taxa[which(soil.taxa$genus == x)[1],] %>% as.character)
+rownames(taxo.step) <- taxcats
+taxo.step <- taxo.step[-dim(taxo.step)[1], ] %>% t() %>% as.data.frame()
+
+taxonlist <- list()
+
+for (i in taxcats[1:which(taxcats == taxalev)]) {
+
+  taxonlist[[i]] <- sapply(taxo.step[, i], function(x) paste(substr(i, 1, 1), "__", x, sep=""))
+
+}
+
+taxonframe <- do.call(cbind, taxonlist) %>% as.data.frame(., row.names = rownames(soil.taxa))
+soil.taxmap <- soil.res
+colnames(soil.taxmap) <- meta.data[meta.data$Type == "Soil", "UVAshort"]
+soil.taxmap$taxonomy <- apply(taxonframe, 1, function(x) paste("r__Root", paste(x, collapse=";"), sep=";"))
+soil.taxmap <- cbind(soil.taxmap, taxo.step)
+```
+
+## Join
+
+```{r}
+# Merge taxonomies
+join.taxa <- merge(x = tree.taxmap, y = soil.taxmap, by = "genus", all = TRUE)
+
+# Extract columns with numbers
+life.res <- join.taxa[, grepl("[0-9]", colnames(join.taxa))]
+life.res[is.na(life.res)] <- 0
+rownames(life.res) <- join.taxa$genus
+
+# Join taxonomy
+alljoin <- rbind(tree.taxmap[,25:31], soil.taxmap[,25:31])
+add.taxa <- sapply(join.taxa$genus, function(x) which(alljoin$genus == x)[1])
+life.taxa <- alljoin[add.taxa,]
+
+# Definitive dataframe
+life.taxmap <- cbind(life.res, life.taxa)
+
+# Save experimental design 
+expdes <- table(meta.data$Condition, meta.data$Type)
+sampsiz <- sum(expdes)
+condsiz <- sum(expdes[,1])
+
+```
+
+## Folder for results
+
+```{r}
+# Folder for results
+folder <- paste("its_results/", taxalev,"/zicoseq/", sep="")
+if (!dir.exists(folder)) {dir.create(folder, recursive = T)}
+
+# Folder for figs
+setwd(folder)
+if (!dir.exists("figs")) {dir.create("figs", recursive = T)}
+```
+
+# Check counts
+
+```{r}
+# Tree counts
+tree.tax.res <- tree.taxmap[, 26:31]
+print("Tree counts")
+apply(tree.tax.res[!is.na(tree.tax.res$kingdom), ], 2, function(x) length(unique(x)))
+sort(table(tree.tax.res[!is.na(tree.tax.res$kingdom), "phylum"]), decreasing = T)
+sort(table(tree.tax.res[!is.na(tree.tax.res$kingdom), "phylum"])/sum(table(tree.tax.res[!is.na(tree.tax.res$kingdom), "phylum"])), decreasing = T)
+
+# Soil counts
+soil.tax.res <- soil.taxmap[, 26:31]
+print("Soil counts")
+apply(soil.tax.res[!is.na(soil.tax.res$kingdom), ], 2, function(x) length(unique(x)))
+sort(table(soil.tax.res[!is.na(soil.tax.res$kingdom), "phylum"]), decreasing = T)
+sort(table(soil.tax.res[!is.na(soil.tax.res$kingdom), "phylum"])/sum(table(soil.tax.res[!is.na(soil.tax.res$kingdom), "phylum"])), decreasing = T)
+```
+
+# Plot tree per type
+
+https://grunwaldlab.github.io/metacoder_documentation/faq.html#the-labels-are-too-small
+
+## Calculations
+
+```{r}
+# # Global obj
+# obj <- parse_tax_data(life.taxmap,
+#                       class_cols = "taxonomy",
+#                       class_sep = ";",
+#                       class_regex = "^([a-z]{0,1})_{0,2}(.*)$",
+#                       class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+# names(obj$data) <- "otu_counts"
+# obj <- filter_taxa(obj, taxon_names != "")
+# obj <- filter_taxa(obj, taxon_names == "Fungi", subtaxa = TRUE)
+
+# Store computed tree by species in a list
+sample.objs <- list()
+
+for (i in unique(meta.data$Type)) {
+  
+  # All samples from the same species
+  sample.taxmap <- life.taxmap[, c(which(meta.data$Type == i), (sampsiz+1):(sampsiz+which(taxcats == taxalev)))]
+  sample.taxmap <- sample.taxmap[which(rowSums(sample.taxmap[1:condsiz]) > 0), ] 
+  sample.obj <- parse_tax_data(sample.taxmap,
+                            class_cols = "taxonomy",
+                            class_sep = ";",
+                            class_regex = "^([a-z]{0,1})_{0,2}(.*)$",
+                            class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+  names(sample.obj$data) <- "otu_counts"
+  sample.obj <- filter_taxa(sample.obj, taxon_names != "")
+  sample.obj <- filter_taxa(sample.obj, taxon_names == "Fungi", subtaxa = TRUE)
+  sample.objs[[i]] <- sample.obj
+  
+}
+
+# Store graphical tree
+plot.trees <- list()
+
+for (i in unique(meta.data$Type)) {
+  
+  plot.trees[[i]] <- sample.objs[[i]] %>% 
+    filter_taxa(grepl(pattern = "^[a-zA-Z]+$", taxon_names)) %>% # remove "odd" taxa
+    filter_taxa(taxon_ranks == "o", supertaxa = TRUE) %>% # subset to the order rank
+    heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+              node_size = n_obs,
+              node_color = n_subtaxa,
+              node_color_range = c("#FDE725FF", "#7AD151FF", "#22A884FF", 
+                                   "#2A788EFF", "#414487FF"),
+              # node_color_interval = c(0, 3),
+              # node_color_interval = c(0, 3),
+              # node_size_interval = c(0, 500),
+              node_label_size_range = c(0.015, 0.04),
+              node_color_digits = 0,
+              node_size_digits = 0,
+              # layout = "davidson-harel", initial_layout = "reingold-tilford",
+              tree_label = NA,
+              node_size_axis_label = "Size: No. OTUs",
+              node_color_axis_label = "Color: No. Subtaxa") +
+    ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.17), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                         inherit.aes = FALSE, show.legend = F) +
+    ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.335), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                         inherit.aes = FALSE, show.legend = F) +
+    ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.50), colour = alpha("darkgrey", 0.5), linetype = "dashed", 
+                         inherit.aes = FALSE, show.legend = F)
+  
+  
+}
+
+```
+
+## Plot trees
+
+```{r, fig.width=10, fig.height=10}
+for (i in unique(meta.data$Type)) {
+  
+  png(filename=paste(folder, "/figs/tree_", i, ".png", sep=""), type="cairo",
+      units="in", width=8, height=6, pointsize=12,
+      res=300)
+  
+  print(plot.trees[[i]])
+  
+  dev.off()
+  
+}
+
+```
+
+# Rarefaction curves
+
+```{r, fig.width=10, fig.height=5}
+# goodcov <- QsRutils::goods(t(life.res))
+raredata <- life.res
+
+## Parallelize multiple cores
+no_cores <- detectCores(logical = TRUE); cl <- makeCluster(no_cores-1); registerDoParallel(cl)
+
+par(mfrow=c(1,2), cex = 1.2)
+
+rarelist <- list()
+for (i in unique(meta.data$Type)) {
+  
+  colselec <- meta.data[meta.data$Type == i, "UVAshort"]
+  rarelist[[i]] <- rarecurve(t(raredata[ , colselec]), step = 10, col = c(rep("orange", condsiz/2), rep("skyblue", condsiz/2)), 
+                             lwd = 1.5,  main = i)
+
+  
+}
+
+```
+
+## Save plots
+
+```{r, fig.width=15, fig.height=5.5}
+png(filename=paste(folder, "figs/rarefaction_curves.png", sep=""), type="cairo",
+      units="in", width=8, height=5.5, pointsize=12,
+      res=300)
+
+# Set layout for 2 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,4,4), nrow = 2, ncol = 3, byrow = TRUE), heights = c(5.5, 0.5), widths = c(0.7,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.2, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+# Common y-axis upper limit
+upY <- sapply(rarelist, 
+              function(x) sapply(x, function(y) y[length(y)])) %>% max()
+
+# Plot
+for (i in unique(meta.data$Type)) {
+  
+  # Get upper axis limits
+  upX <- sapply(rarelist[[i]], function(x) names(x[length(x)])) %>% 
+    gsub(pattern = "N", replacement = "") %>%
+    as.numeric() %>%
+    max()
+  # upY <- sapply(rarelist[[i]], function(x) x[length(x)]) %>%
+  #   max()
+  
+  if (i == unique(meta.data$Type)[1]) {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = seq(0,upY,50))
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= condsiz/2) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = FALSE)
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= condsiz/2) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  }
+ 
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declining", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+```
+
+## Common x axis
+
+```{r, fig.width=16, fig.height=5.5}
+
+png(filename=paste(folder, "figs/rarefaction_curves_commonX.png", sep=""), type="cairo",
+      units="in", width=8, height=5.5, pointsize=12,
+      res=300)
+
+# Set layout for 2 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,4,4), nrow = 2, ncol = 3, byrow = TRUE), heights = c(5.5, 0.5), widths = c(0.7,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.2, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+# Common x and y-axis upper limit
+upY <- sapply(rarelist, 
+              function(x) sapply(x, function(y) y[length(y)])) %>% max()
+
+upX <- sapply(rarelist, 
+              function(y) sapply(y, function(x) names(x[length(x)]))) %>% 
+  gsub(pattern = "N", replacement = "") %>%
+  as.numeric() %>%
+  max()
+
+# Plot
+for (i in unique(meta.data$Type)) {
+  
+  # Get upper axis limits
+  # upX <- sapply(rarelist[[i]], function(x) names(x[length(x)])) %>% 
+  #   gsub(pattern = "N", replacement = "") %>%
+  #   as.numeric() %>%
+  #   max()
+  # upY <- sapply(rarelist[[i]], function(x) x[length(x)]) %>%
+  #   max()
+  
+  if (i == unique(meta.data$Type)[1]) {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = seq(0,upY,50))
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= condsiz/2) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(1, upX), ylim = c(0, upY), 
+         ylab = NA, xlab = NA, main = i, yaxt = "n")
+    axis(2, at = seq(0,upY,50), labels = FALSE)
+    title(xlab="Sample size", line=2.5)
+
+    # Background grid
+    grid()
+    # Counter for color
+    countcol <- 1
+    
+    # Subset replicate
+    rareplot <- rarelist[[i]]
+    for (j in rareplot) {
+      xaxis <- as.numeric(gsub("N", "", names(j)))
+      lines(xaxis, j, lwd = 3, col = if (countcol <= condsiz/2) "orange" else "skyblue")
+      countcol <- countcol + 1
+    }
+    
+  }
+ 
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declining", "Healthy"),
+       fill=c("orange","skyblue"))
+
+dev.off()
+```
+
+# Venn diagram
+
+```{r, fig.width=5, fig.height=5}
+# Get sample categories and frequencies
+catsamp <- gsub("[[:digit:]]", "", colnames(life.res)) %>% table
+criteria <- 10
+
+# Per tree species
+vennParcList <- list()
+
+for (j in unique(meta.data$Type)) {
+  
+  for (k in unique(meta.data$Condition)) {
+    
+    selectcol <- which(meta.data$Type == j & meta.data$Condition == k)
+    vennParcList[[paste(k, j)]] <- apply(life.res[, selectcol], 1, function(x) length(which(x != 0))) %>% t
+    
+  }
+  
+}
+
+
+vennParcList.names <- lapply(vennParcList, function(x) colnames(x)[x >= criteria])
+
+# Helper function to display Venn diagram
+display_venn <- function(x, ...){
+  grid.newpage()
+  venn_object <- venn.diagram(x, filename = NULL, disable.logging = TRUE, ...)
+  grid.draw(venn_object)
+}
+
+png(filename=paste(folder, "figs/venn_diagram.png", sep=""), type="cairo",
+      units="in", width=6.8, height=6, pointsize=12,
+      res=300)
+
+display_venn(vennParcList.names,
+             category.names = names(vennParcList.names),
+             cat.default.pos = "outer",
+             cat.col = rep(c("orange", "lightblue"), 2),
+             col = rep(c("orange", "lightblue"), 2),
+             fill = rep(c(alpha("orange",0.3), alpha('lightblue',0.3)), 2),
+             lty = c(rep("solid", 2), rep("dashed", 2)),
+             print.mode = c("raw"),
+             fontfamily = "Helvetica",
+             cat.fontfamily = "Helvetica",
+             margin = 0.05)
+
+dev.off()
+
+```
+
+## Save excel
+
+```{r}
+# Get intersections
+intervenn <- gplots::venn(vennParcList.names, show.plot = FALSE)
+intervenn <- attributes(intervenn)$intersections
+names(intervenn) <- gsub(":", ".", names(intervenn))
+
+# Save excel
+wb <- createWorkbook()
+
+for (i in names(intervenn)) {
+  
+    sheet <- createSheet(wb, i)
+    addDataFrame(intervenn[[i]], sheet=sheet, startColumn=1, row.names=TRUE, showNA = T)
+    
+}
+
+saveWorkbook(wb, paste0(folder, "venn_Declining.xlsx"))
+
+```
+
+
+# Hill diversity
+
+Source code and explanations: https://mikeroswell.github.io/MeanRarity/articles/Using_MeanRarity.html
+
+- effective number of rare species, S (l= 1, q=0, species richness), 
+- effective number of common species, eH' (l = 0, q=1, Shannon diversity or exponential or Shannon entropy), 
+- effective number of highly abundant species, 1/D (l = -1, q=2, Simpson diversity or the inverse of Simpson concentration)
+  
+```{r}
+# Vector for "l" exponent values
+hillexps <- seq(-1, 1, 0.01)
+
+# Estimate Hill diversity per sample and for every "l" value
+hillframe <- as.data.frame(t(apply(life.res, 2, function(x) sapply(hillexps, function(y) rarity(x, y)))))
+
+# Add "l" values as column names
+colnames(hillframe) <- hillexps
+
+# Add variables data (sampling site, health status)
+hillframe.var <- cbind(meta.data, hillframe)
+
+# Long format to ease plotting
+hillframe.long <- hillframe.var %>% gather(Hill, value, -(1:10))
+hillframe.long$Hill <- as.numeric(hillframe.long$Hill)
+hillframe.long$UVAshort <- as.factor(hillframe.long$UVAshort)
+hillframe.long$Sample <- as.factor(hillframe.long$Sample)
+hillframe.long$Type <- as.factor(hillframe.long$Type)
+hillframe.long$Condition <- as.factor(hillframe.long$Condition)
+```
+
+## Save plot lines
+
+```{r, fig.width=15, fig.height=6}
+
+png(filename=paste(folder, "figs/hill_diversity_lines.png", sep=""), type="cairo",
+      units="in", width=15, height=6.5, pointsize=12,
+      res=300)
+
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(5.5, 1), widths = c(0.7,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.5, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+
+# Plot
+for (i in unique(hillframe.long$Sample)) {
+  
+  if (i == unique(meta.data$Sample)[1]) {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)),
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0,250,50), labels = seq(0,250,50))
+    title(xlab = "Hill diversity", line=2.5)
+    
+    # Background grid
+    grid()
+    # Subset sampling site
+    Sampleplot <- hillframe.long[hillframe.long$Sample == i, ]
+    
+    for (j in unique(hillframe.long$UVAshort)) {
+      
+      # Subset replicate
+      uvaplot <- Sampleplot[Sampleplot$UVAshort == j, ]
+      
+      for (k in unique(hillframe.long$Condition)) {
+        
+        # Subset status and plot
+        condiplot <- uvaplot[uvaplot$Condition == k, ]
+        lines(condiplot$Hill, condiplot$value, lwd = 3, 
+              lty = ifelse(condiplot$Type == "Tree", "solid", "dashed"),
+              col = if (k == "Declining") "orange" else "skyblue")
+        
+      }
+      
+    } 
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)), 
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0, 250, 50), labels = FALSE)
+    title(xlab = "Hill diversity", line=2.5)
+    # Background grid
+    grid()
+    # Subset sampling site
+    Sampleplot <- hillframe.long[hillframe.long$Sample == i, ]
+    
+    for (j in unique(hillframe.long$UVAshort)) {
+      
+      # Subset replicate
+      uvaplot <- Sampleplot[Sampleplot$UVAshort == j, ]
+      
+      for (k in unique(hillframe.long$Condition)) {
+        
+        # Subset status and plot
+        condiplot <- uvaplot[uvaplot$Condition == k, ]
+        lines(condiplot$Hill, condiplot$value, lwd = 3, 
+              lty = ifelse(condiplot$Type == "Tree", "solid", "dashed"),
+              col = if (k == "Declining") "orange" else "skyblue")
+        
+        
+      }
+      
+    }
+    
+  }
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=4, bty = "n", legend=c("Declining", "Healthy", "Tree", "Soil"),
+       pch = c(15,15,NA,NA),
+       lty = c(NA,NA,"solid","dashed"), 
+       col = c("orange","lightblue","black","black"),
+       pt.cex = 1.2,
+       lwd = 3)
+
+dev.off()
+
+```
+
+## Save average plot lines
+
+```{r, fig.width=15, fig.height=6}
+
+png(filename=paste(folder, "figs/hill_diversity_lines_average.png", sep=""), type="cairo",
+      units="in", width=15, height=6.5, pointsize=12,
+      res=300)
+
+# Set layout for 4 plots and legend at the bottom
+layout(mat = matrix(c(1,2,3,4,5,6,6,6,6,6), nrow = 2, ncol = 5, byrow = TRUE), heights = c(5.5, 1), widths = c(0.7,4,4,4,4))
+# Size of labels and margins of each plot
+par(cex = 1.5, mai = c(1, 0.3, 0.8, 0.1))
+# Empty plot to write a single ylab at the beginning
+plot(NULL, xlim = c(0,1), ylim = c(0,1), yaxt="n", xaxt="n", bty = "n", ylab = NA, xlab = NA)
+title(ylab="No. of Genera", line=0)
+
+
+# Plot
+for (i in unique(hillframe.long$Sample)) {
+  
+  if (i == unique(meta.data$Sample)[1]) {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)),
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0,250,50), labels = seq(0,250,50))
+    title(xlab = "Hill diversity", line=2.5)
+    
+    # Background grid
+    grid()
+    # Subset sampling site
+    Sampleplot <- hillframe.long[hillframe.long$Sample == i, ]
+    
+    for (k in unique(hillframe.long$Condition)) {
+      
+      for (l in unique(hillframe.long$Type)) {
+        
+        # Subset status and plot
+        condiplot <- Sampleplot[Sampleplot$Condition == k & Sampleplot$Type == l, ]
+        # Estimate mean
+        mean.condiplot <- aggregate(value ~ Hill, condiplot, mean)
+        sd.condiplot <- aggregate(value ~ Hill, condiplot, function(x) sd(x)/sqrt(3))
+        polygon(x = c(sd.condiplot$Hill, rev(sd.condiplot$Hill)), 
+                y = c(mean.condiplot$value + sd.condiplot$value, rev(mean.condiplot$value - sd.condiplot$value)), 
+                col = if (k == "Declining") scales::alpha("orange", 0.2) else scales::alpha("skyblue", 0.2),
+                border = NA)
+        lines(mean.condiplot$Hill, mean.condiplot$value, lwd = 3, 
+              lty = if (l == "Tree") "solid" else "dashed",
+              col = if (k == "Declining") "orange" else "skyblue")
+        
+      }
+      
+    } 
+    
+  } else {
+    
+    # Empty plot
+    plot(NULL, xlim = c(-1, 1), ylim = c(0, max(hillframe.long$value)), 
+         yaxt = "n", ylab = NA, xlab = NA, main = i)
+    axis(2, at = seq(0, 250, 50), labels = FALSE)
+    title(xlab = "Hill diversity", line=2.5)
+    # Background grid
+    grid()
+    # Subset sampling site
+    Sampleplot <- hillframe.long[hillframe.long$Sample == i, ]
+    
+    for (k in unique(hillframe.long$Condition)) {
+      
+      for (l in unique(hillframe.long$Type)) {
+        
+        # Subset status and plot
+        condiplot <- Sampleplot[Sampleplot$Condition == k & Sampleplot$Type == l, ]
+        # Estimate mean
+        mean.condiplot <- aggregate(value ~ Hill, condiplot, mean)
+        sd.condiplot <- aggregate(value ~ Hill, condiplot, function(x) sd(x)/sqrt(3))
+        polygon(x = c(sd.condiplot$Hill, rev(sd.condiplot$Hill)), 
+                y = c(mean.condiplot$value + sd.condiplot$value, rev(mean.condiplot$value - sd.condiplot$value)), 
+                col = if (k == "Declining") scales::alpha("orange", 0.2) else scales::alpha("skyblue", 0.2),
+                border = NA)
+        lines(mean.condiplot$Hill, mean.condiplot$value, lwd = 3, 
+              lty = if (l == "Tree") "solid" else "dashed",
+              col = if (k == "Declining") "orange" else "skyblue")
+        
+      }
+      
+    }
+    
+  }
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0))
+plot.new()
+legend(x="center", ncol=4, bty = "n", legend=c("Declining", "Healthy", "Tree", "Soil"),
+       pch = c(15,15,NA,NA),
+       lty = c(NA,NA,"solid","dashed"), 
+       col = c("orange","lightblue","black","black"),
+       pt.cex = 1.2,
+       lwd = 3)
+
+dev.off()
+
+```
+
+# Running ZicoSeq (w / health)
+
+Tutorial source: https://cran.r-project.org/web/packages/GUniFrac/vignettes/ZicoSeq.html
+
+```{r}
+
+zico.list <- list()
+meta.list <- list()
+
+set.seed(123456)
+
+for (h in unique(meta.data$Condition)) {
+  
+  for (i in unique(meta.data$Sample)) {
+    
+    # Subset samples in abundance matrix according to condition and sample
+    res.to.zico <- as.matrix(life.res[, which(meta.data$Sample == i & meta.data$Condition == h)])
+    # res.to.zico <- res.to.zico[-which(rowSums(res.to.zico) == 0), ]
+    remove.empty <- apply(res.to.zico, 1, function(x) length(which(x == 0)))
+    res.to.zico <- res.to.zico[which(remove.empty <= 2), ]
+    meta.to.zico <- meta.data[meta.data$Sample == i & meta.data$Condition == h, ]
+    
+    # Run ZicoSeq
+    zico.list[[h]][[i]] <- ZicoSeq(meta.dat = meta.to.zico, feature.dat = res.to.zico, 
+                                   grp.name = 'Type', adj.name = NULL, 
+                                   feature.dat.type = "count",
+                                   # Filter to remove rare taxa
+                                   prev.filter = 0.2, mean.abund.filter = 0,  
+                                   max.abund.filter = 0.002, min.prop = 0, 
+                                   # Winsorization to replace outliers
+                                   is.winsor = TRUE, outlier.pct = 0.1, 
+                                   winsor.end = 'top',
+                                   # Posterior sampling 
+                                   is.post.sample = TRUE, post.sample.no = 25, 
+                                   # Use the square-root transformation
+                                   link.func = list(function (x) x^0.5), 
+                                   stats.combine.func = max,
+                                   # Permutation-based multiple testing correction
+                                   perm.no = 500,  strata = NULL, 
+                                   # Reference-based multiple stage normalization
+                                   ref.pct = 0.5, stage.no = 12, excl.pct = 0.2,
+                                   # Family-wise error rate control
+                                   is.fwer = TRUE, verbose = TRUE, 
+                                   return.feature.dat = T)
+    # Store meta
+    meta.list[[h]][[i]] <- meta.to.zico
+    
+  }
+  
+}
+
+saveRDS(list(zico.list = zico.list, meta.list = meta.list), paste0(folder, "/zicoResults_whealth.RDS"))
+
+```
+
+## Save excel
+
+```{r}
+# Per species
+sig.feat.list <- list()
+
+for (h in unique(meta.data$Condition)) {
+  
+  for (i in unique(meta.data$Sample)) {
+    
+    
+    # Select genres with adjusted pval < 0.1
+    sig.features <- which(zico.list[[h]][[i]]$p.adj.fdr < 0.1)
+    
+    # Negative R2 means more abundant in Soil samples
+    pval.r2 <- data.frame(pval = zico.list[[h]][[i]]$p.adj.fdr[sig.features],
+                          r2 = zico.list[[h]][[i]]$R2[sig.features]*sign(zico.list[[h]][[i]]$coef.list[[1]][2,sig.features]))
+    
+    # Store in a list
+    sig.feat.list[[h]][[i]] <- pval.r2
+    
+  }
+  
+}
+
+
+# Save excel
+wb <- createWorkbook()
+
+for (h in unique(meta.data$Condition)) {
+  
+  for (i in unique(meta.data$Sample)) {
+  
+    sheet <- createSheet(wb, paste0(h, ".", i))
+    addDataFrame(sig.feat.list[[h]][[i]], sheet=sheet, startColumn=1, row.names=TRUE, showNA = T)
+    
+  }
+  
+}
+
+saveWorkbook(wb, paste0(folder, "zicoseq_pvals_r2_whealth.xlsx"))
+```
+
+
+## Volcano plot
+
+```{r, fig.width=15}
+plotlist <- lapply(1:4, function(x) ZicoSeq.plot(zico.list[[x]], meta.list[[x]], pvalue.type = 'p.adj.fdr', 
+                                                 cutoff = 0.00001, text.size = 8,
+                                                 out.dir = NULL, width = 8, height = 8) +
+                     ylim(0, 4) +
+                     xlim(-0.3, 0.3) +
+                     geom_hline(yintercept=-log(0.1,10), linetype="dashed", color = "gray", lwd = 1) +
+                     geom_hline(yintercept=-log(0.05,10), linetype="dashed", color = "red", lwd = 1) +
+                     geom_hline(yintercept=-log(0.01,10), linetype="dashed", color = "purple", lwd = 1) +
+                     geom_vline(xintercept= -0.1, linetype="dotted", color = "orange", lwd = 1) +
+                     geom_vline(xintercept= 0.1, linetype="dotted", color = "lightblue", lwd = 1) +
+                     # coord_cartesian(ylim = c(0, 4), clip = "off") +
+                     # annotate("text", x = -0.25, y = 4.2, label = "Declining") +
+                     # annotate("text", x = 0.25, y = 4.2, label = "Healthy") +
+                     geom_text(x=-0.25, y=4.05, label="Declining", col = "darkgrey", size = 5) +
+                     geom_text(x=0.25, y=4.05, label="Healthy", col = "darkgrey", size = 5) +
+                     ggtitle(names(zico.list)[x]) +
+                     theme(plot.title = element_text(hjust = 0.5, size = 18),
+                           axis.text=element_text(size=12),
+                           axis.title=element_text(size=14),
+                           legend.title=element_text(size=12),
+                           legend.text=element_text(size=12)))
+         # theme(plot.title = element_text(hjust = 0.5),
+         #       panel.grid.major = element_blank(), panel.grid.minor = element_blank()))
+
+png(filename=paste(folder, "/figs/zicoseq.png", sep=""), type="cairo",
+    units="in", width=20, height=6, pointsize=12,
+    res=300)
+  
+ggarrange(plotlist = plotlist, ncol = 4, nrow = 1, common.legend = T)
+
+dev.off()
+
+# ZicoSeq.plot(ZicoSeq.obj, meta.to.zico, pvalue.type = 'p.adj.fdr', 
+#              cutoff = 0.1, text.size = 10,
+#              out.dir = NULL, width = 8, height = 8) +
+#   ggtitle("Hola") +
+#   theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+## Trees
+
+### Calculations
+
+```{r, fig.width=8, fig.height=6}
+
+set.seed(12345)
+vircols <- viridis(5)
+
+# Get all taxonomy names involved in zicoseq
+all.names <- list()
+
+for (h in unique(meta.data$Condition)) {
+  
+  for (i in unique(meta.data$Sample)) {
+    
+    all.names[[h]][[i]] <- names(zico.list[[h]][[i]]$p.adj.fdr)
+    
+  }
+  
+}
+
+# Unique
+all.names.vec <-  unlist(all.names) %>% unique
+all.names.num <- rep(0, length(all.names.vec))
+names(all.names.num) <- all.names.vec
+aa <- life.taxmap[which(rownames(life.taxmap) %in% all.names.vec), ]
+
+###############
+# Empty tree
+cc <- data.frame(r2 = all.names.num, aa[49:55])
+
+# All samples from the same species
+sample.obj <- parse_tax_data(cc,
+                             class_cols = "taxonomy", # the column that contains taxonomic information
+                             class_sep = ";", # The character used to separate taxa in the classification
+                             class_regex = "^(.+)__(.+)$", # Regex identifying where the data for each taxon is
+                             class_key = c(tax_rank = "info", # A key describing each regex capture group
+                                           tax_name = "taxon_name"))
+sample.obj <- filter_taxa(sample.obj, taxon_names == "Fungi", subtaxa = TRUE)
+sample.obj$data$tax_abund <- calc_taxon_abund(sample.obj, "tax_data",
+                                              cols = "r2")
+
+colnames(sample.obj$data$tax_abund) <- c("taxon_id", "R2")
+empty.tree <- sample.obj %>% heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+                                       node_size = n_subtaxa,
+                                       node_size_range = c(0.01, 0.03),
+                                       node_color = R2,
+                                       node_color_interval = c(-0.5, 0.5),
+                                       node_color_range = c("burlywood3", alpha("lightgray",0.2), "forestgreen"),
+                                       node_label_color = "black",
+                                       # node_label_size = abs(R2),
+                                       node_label_size_range = c(0.012, 0.025),
+                                       tree_label = NA,
+                                       make_node_legend = F,
+                                       layout = "reingold-tilford") +
+  # initial_layout = "reingold-tilford") +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.10), colour = alpha(vircols[1], 0.2), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.20), colour = alpha(vircols[2], 0.2), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.30), colour = alpha(vircols[3], 0.2), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.40), colour = alpha(vircols[4], 0.2), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F) +
+  ggforce::geom_circle(aes(x0 = 0.5, y0 = 0.5, r = 0.50), colour = alpha(vircols[5], 0.2), linetype = "dashed", 
+                       inherit.aes = FALSE, show.legend = F)
+
+######################
+# Coloured trees
+plot.tree.zico <- list()
+
+for (h in unique(meta.data$Condition)) {
+
+  for (i in unique(meta.data$Sample)) {
+
+    # Bind R2 from ZicoSeq with taxonomic data
+    r2 <- sapply(1:length(zico.list[[h]][[i]]$p.adj.fdr), 
+                 function(x) ifelse(zico.list[[h]][[i]]$p.adj.fdr[x] < 0.1, 
+                                    zico.list[[h]][[i]]$R2[x]*sign(zico.list[[h]][[i]]$coef.list[[1]][2,x]),
+                                    0))
+    
+    r2 <- tapply(c(all.names.num, r2), names(c(all.names.num, r2)), sum)
+    # names(r2) <- names(zico.list[[h]][[i]]$p.adj.fdr)
+    cc <- cbind(r2, aa[49:55])
+    
+    # Assign a 0 to R2 bellow abs(0.1)
+    cc$r2 <- sapply(cc$r2, function(x) ifelse(abs(x) < 0.1, 0, x))
+    
+    # All samples from the same species
+    sample.obj <- parse_tax_data(cc,
+                                 class_cols = "taxonomy", # the column that contains taxonomic information
+                                 class_sep = ";", # The character used to separate taxa in the classification
+                                 class_regex = "^(.+)__(.+)$", # Regex identifying where the data for each taxon is
+                                 class_key = c(tax_rank = "info", # A key describing each regex capture group
+                                               tax_name = "taxon_name"))
+    sample.obj <- filter_taxa(sample.obj, taxon_names == "Fungi", subtaxa = TRUE)
+    sample.obj$data$tax_abund <- calc_taxon_abund(sample.obj, "tax_data",
+                                                  cols = "r2")
+    
+    colnames(sample.obj$data$tax_abund) <- c("taxon_id", "R2")
+    plot.tree.zico[[h]][[i]] <- sample.obj %>% heat_tree(node_label = NA,
+                                                    node_size = n_subtaxa,
+                                                    node_size_range = c(0.01, 0.03),
+                                                    node_color = R2,
+                                                    node_color_interval = c(-0.5, 0.5),
+                                                    node_color_range = c("burlywood3", alpha("lightgray",0.2), "forestgreen"),
+                                                    # node_label_size = abs(R2),
+                                                    # node_label_size_range = c(0.01, 0.02),
+                                                    tree_label = NA,
+                                                    make_node_legend = F,
+                                                    layout = "reingold-tilford")
+    
+  }
+
+}
+
+
+
+```
+
+
+### Plot trees
+
+```{r}
+# Plot empty tree
+png(filename=paste(folder, "/figs/zicotree_empty.png", sep=""), type="cairo",
+    units="in", width=8, height=6, pointsize=12,
+    res=300)
+
+print(empty.tree)
+
+dev.off()
+
+
+# Plot coloured trees
+for (h in unique(meta.data$Condition)) {
+  
+  for (i in unique(meta.data$Sample)) {
+    
+    png(filename=paste(folder, "/figs/zicotree_", h, "_", i, ".png", sep=""), type="cairo",
+        units="in", width=8, height=6, pointsize=12,
+        res=300)
+    
+    print(plot.tree.zico[[h]][[i]])
+    
+    dev.off()
+    
+  }
+  
+}
+```
+### Individual coloured trees
+
+```{r}
+######################
+# Coloured trees
+plot.tree.zico <- list()
+
+for (h in unique(meta.data$Condition)) {
+
+  for (i in unique(meta.data$Sample)) {
+
+    # Bind R2 from ZicoSeq with taxonomic data
+    r2 <- sapply(1:length(zico.list[[h]][[i]]$p.adj.fdr), 
+                 function(x) ifelse(zico.list[[h]][[i]]$p.adj.fdr[x] < 0.1, 
+                                    zico.list[[h]][[i]]$R2[x]*sign(zico.list[[h]][[i]]$coef.list[[1]][2,x]),
+                                    0))
+    
+    r2 <- tapply(c(all.names.num, r2), names(c(all.names.num, r2)), sum)
+    # names(r2) <- names(zico.list[[h]][[i]]$p.adj.fdr)
+    cc <- cbind(r2, aa[49:55])
+    
+    # Assign a 0 to R2 bellow abs(0.1)
+    cc$r2 <- sapply(cc$r2, function(x) ifelse(abs(x) < 0.1, 0, x))
+    
+    # All samples from the same species
+    sample.obj <- parse_tax_data(cc,
+                                 class_cols = "taxonomy", # the column that contains taxonomic information
+                                 class_sep = ";", # The character used to separate taxa in the classification
+                                 class_regex = "^(.+)__(.+)$", # Regex identifying where the data for each taxon is
+                                 class_key = c(tax_rank = "info", # A key describing each regex capture group
+                                               tax_name = "taxon_name"))
+    sample.obj <- filter_taxa(sample.obj, taxon_names == "Fungi", subtaxa = TRUE)
+    sample.obj$data$tax_abund <- calc_taxon_abund(sample.obj, "tax_data",
+                                                  cols = "r2")
+    
+    colnames(sample.obj$data$tax_abund) <- c("taxon_id", "R2")
+    plot.tree.zico[[h]][[i]] <- sample.obj %>% heat_tree(node_label = gsub(pattern = "\\[|\\]", replacement = "", taxon_names),
+                                                    node_size = n_subtaxa,
+                                                    node_size_range = c(0.01, 0.03),
+                                                    node_color = R2,
+                                                    node_color_interval = c(-0.5, 0.5),
+                                                    node_color_range = c("burlywood3", alpha("lightgray",0.2), "forestgreen"),
+                                                    node_label_color = ifelse(sample.obj$data$tax_abund$R2 != 0, "black", "darkgray"),
+                                                    # node_label_size = abs(R2),
+                                                    # node_label_size_range = c(0.01, 0.02),
+                                                    tree_label = NA,
+                                                    make_node_legend = F,
+                                                    layout = "reingold-tilford",
+                                                    title = paste(h, i))
+    
+  }
+
+}
+
+# Plot trees
+
+# Plot coloured trees
+for (h in unique(meta.data$Condition)) {
+  
+  for (i in unique(meta.data$Sample)) {
+    
+    png(filename=paste(folder, "/figs/zicotree_names_", h, "_", i, ".png", sep=""), type="cairo",
+        units="in", width=8, height=6, pointsize=12,
+        res=300)
+    
+    print(plot.tree.zico[[h]][[i]])
+    
+    dev.off()
+    
+  }
+  
+}
+
+```
+
+# Running ZicoSeq (w/o health)
+
+Tutorial source: https://cran.r-project.org/web/packages/GUniFrac/vignettes/ZicoSeq.html
+
+```{r}
+
+# zico.list <- list()
+# meta.list <- list()
+# 
+# set.seed(123456)
+# 
+# for (i in unique(meta.data$Sample)) {
+#   
+#   # Subset samples in abundance matrix according to condition and sample
+#   res.to.zico <- as.matrix(life.res[, which(meta.data$Sample == i & meta.data$Condition == h)])
+#   res.to.zico <- res.to.zico[-which(rowSums(res.to.zico) == 0), ]
+#   meta.to.zico <- meta.data[meta.data$Sample == i & meta.data$Condition == h, ]
+#   
+#   # Run ZicoSeq
+#   zico.list[[h]][[i]] <- ZicoSeq(meta.dat = meta.to.zico, feature.dat = res.to.zico, 
+#                                  grp.name = 'Type', adj.name = NULL, 
+#                                  feature.dat.type = "count",
+#                                  # Filter to remove rare taxa
+#                                  prev.filter = 0.2, mean.abund.filter = 0,  
+#                                  max.abund.filter = 0.002, min.prop = 0, 
+#                                  # Winsorization to replace outliers
+#                                  is.winsor = TRUE, outlier.pct = 0.1, 
+#                                  winsor.end = 'top',
+#                                  # Posterior sampling 
+#                                  is.post.sample = TRUE, post.sample.no = 25, 
+#                                  # Use the square-root transformation
+#                                  link.func = list(function (x) x^0.5), 
+#                                  stats.combine.func = max,
+#                                  # Permutation-based multiple testing correction
+#                                  perm.no = 500,  strata = NULL, 
+#                                  # Reference-based multiple stage normalization
+#                                  ref.pct = 0.5, stage.no = 12, excl.pct = 0.2,
+#                                  # Family-wise error rate control
+#                                  is.fwer = TRUE, verbose = TRUE, 
+#                                  return.feature.dat = T)
+#   # Store meta
+#   meta.list[[h]][[i]] <- meta.to.zico
+#   
+#   
+# }
+# 
+# saveRDS(list(zico.list = zico.list, meta.list = meta.list), paste0(folder, "/zicoResults_wohealth.RDS"))
+
+```
+
+# Fungal traits {.tabset .tabset-fade .tabset-pills}
+
+## Declining
+
+### Estimate
+
+```{r}
+# Read fungal traits csv
+fungalTraits <- read.csv("../../FungalTraits 1.2_ver_16Dec_2020 - V.1.2.csv")
+dec.res <- life.res[,meta.data$Condition == "Declining"]
+traits24 <- fungalTraits[fungalTraits$GENUS %in% rownames(dec.res), c("GENUS", "primary_lifestyle")] 
+
+# Add abundancy information
+traits24 <- cbind(traits24, dec.res[match(traits24$GENUS, rownames(dec.res)), ])
+traits24$primary_lifestyle <- gsub("unspecified_", "", traits24$primary_lifestyle)
+traits24$primary_lifestyle <- gsub("_", " ", traits24$primary_lifestyle)
+traits24$primary_lifestyle <- as.factor(traits24$primary_lifestyle)
+
+# Select sampling site declined/healthy and sum
+# Add 1 to avoid -Inf in log transformation
+sampsite.list <- list()
+
+for (i in c("L", "V", "A", "C")) {
+  
+  sampsite.soil <- traits24[, grep(paste0("S", i), colnames(traits24))] %>% rowsum(., group = traits24$primary_lifestyle) + 1
+  sampsite.tree <- traits24[, grep(paste0("T", i), colnames(traits24))] %>% rowsum(., group = traits24$primary_lifestyle) + 1
+  sampsite.list[[i]] <- list(Soil = sampsite.soil, Tree = sampsite.tree)
+  
+}
+
+names(sampsite.list) <- c("Chestnut", "Cork oak", "Holm oak", "Pyrenean oak")
+
+
+
+```
+
+### Lollipop plot 
+
+```{r, fig.width=16, fig.height=12}
+
+# par(mfrow=c(2,2))
+
+png(filename=paste(folder, "figs/functional_lollipop_declining.png", sep=""), type="cairo",
+      units="in", width=16, height=14, pointsize=12,
+      res=300)
+
+layout(mat = matrix(c(1,2,3,4,5,5), nrow = 3, ncol = 2, byrow = TRUE), heights = c(6, 6, 0.5), widths = c(8,8))
+# par(cex = 1.8, mai = c(1.6, 0.3, 0.8, 0.1))
+
+for (i in c("Chestnut", "Cork oak", "Holm oak", "Pyrenean oak")) {
+  
+  # Extract data from list
+  sitesel <- sampsite.list[[i]]
+  absum.h <- sitesel$Tree %>% log(., 2) %>% rowSums()
+  absum.h <- absum.h/sum(absum.h)
+  absum.d <- sitesel$Soil %>% log(., 2) %>% rowSums()
+  absum.d <- absum.d/sum(absum.d)
+  
+  # Order by diseased importance
+  absum.h <- absum.h[order(absum.d)]
+  absum.d <- absum.d[order(absum.d)]
+  numtraits <- length(absum.h)
+  
+  # Plot
+  par(mgp=c(2,1,0), mar=c(4, 10, 2, 1), cex = 1.2)
+  plot(rep(0, numtraits), 1:numtraits, xlim = c(0, max(c(absum.h, absum.d))), col = "white", yaxt = "n", 
+       ylab = "", xlab = "log2(abundance)", main = i)
+  # title(xlab="log2(abundance)", line=2, cex.lab=1.2)
+  axis(side = 2, at =  1:numtraits, labels = names(absum.h), las = 2)
+  segments(x0 = absum.d, y0 = 1:numtraits, x1 = absum.h, y1 = 1:numtraits)
+  points(absum.d, 1:numtraits, pch=19, col = "burlywood3")
+  points(absum.h, 1:numtraits, pch=19, col = "forestgreen")
+  
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0), cex = 1.5)
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Soil", "Tree"),
+       fill=c("burlywood3","forestgreen"))
+
+dev.off()
+
+```
+
+## Healthy
+
+### Estimate
+
+```{r}
+# Read fungal traits csv
+fungalTraits <- read.csv("../../FungalTraits 1.2_ver_16Dec_2020 - V.1.2.csv")
+dec.res <- life.res[,meta.data$Condition == "Healthy"]
+traits24 <- fungalTraits[fungalTraits$GENUS %in% rownames(dec.res), c("GENUS", "primary_lifestyle")] 
+
+# Add abundancy information
+traits24 <- cbind(traits24, dec.res[match(traits24$GENUS, rownames(dec.res)), ])
+traits24$primary_lifestyle <- gsub("unspecified_", "", traits24$primary_lifestyle)
+traits24$primary_lifestyle <- gsub("_", " ", traits24$primary_lifestyle)
+traits24$primary_lifestyle <- as.factor(traits24$primary_lifestyle)
+
+# Select sampling site declined/healthy and sum
+# Add 1 to avoid -Inf in log transformation
+sampsite.list <- list()
+
+for (i in c("L", "V", "A", "C")) {
+  
+  sampsite.soil <- traits24[, grep(paste0("S", i), colnames(traits24))] %>% rowsum(., group = traits24$primary_lifestyle) + 1
+  sampsite.tree <- traits24[, grep(paste0("T", i), colnames(traits24))] %>% rowsum(., group = traits24$primary_lifestyle) + 1
+  sampsite.list[[i]] <- list(Soil = sampsite.soil, Tree = sampsite.tree)
+  
+}
+
+names(sampsite.list) <- c("Chestnut", "Cork oak", "Holm oak", "Pyrenean oak")
+
+
+
+```
+
+### Lollipop plot 
+
+```{r, fig.width=16, fig.height=12}
+
+# par(mfrow=c(2,2))
+
+png(filename=paste(folder, "figs/functional_lollipop_Healthy.png", sep=""), type="cairo",
+      units="in", width=16, height=14, pointsize=12,
+      res=300)
+
+layout(mat = matrix(c(1,2,3,4,5,5), nrow = 3, ncol = 2, byrow = TRUE), heights = c(6, 6, 0.5), widths = c(8,8))
+# par(cex = 1.8, mai = c(1.6, 0.3, 0.8, 0.1))
+
+for (i in c("Chestnut", "Cork oak", "Holm oak", "Pyrenean oak")) {
+  
+  # Extract data from list
+  sitesel <- sampsite.list[[i]]
+  absum.h <- sitesel$Tree %>% log(., 2) %>% rowSums()
+  absum.h <- absum.h/sum(absum.h)
+  absum.d <- sitesel$Soil %>% log(., 2) %>% rowSums()
+  absum.d <- absum.d/sum(absum.d)
+  
+  # Order by diseased importance
+  absum.h <- absum.h[order(absum.d)]
+  absum.d <- absum.d[order(absum.d)]
+  numtraits <- length(absum.h)
+  
+  # Plot
+  par(mgp=c(2,1,0), mar=c(4, 10, 2, 1), cex = 1.2)
+  plot(rep(0, numtraits), 1:numtraits, xlim = c(0, max(c(absum.h, absum.d))), col = "white", yaxt = "n", 
+       ylab = "", xlab = "log2(abundance)", main = i)
+  # title(xlab="log2(abundance)", line=2, cex.lab=1.2)
+  axis(side = 2, at =  1:numtraits, labels = names(absum.h), las = 2)
+  segments(x0 = absum.d, y0 = 1:numtraits, x1 = absum.h, y1 = 1:numtraits)
+  points(absum.d, 1:numtraits, pch=19, col = "burlywood3")
+  points(absum.h, 1:numtraits, pch=19, col = "forestgreen")
+  
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0), cex = 1.5)
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Soil", "Tree"),
+       fill=c("burlywood3","forestgreen"))
+
+dev.off()
+
+```
+
+## Combined figure
+
+### Estimate
+
+```{r}
+# Read fungal traits csv
+fungalTraits <- read.csv("../../FungalTraits 1.2_ver_16Dec_2020 - V.1.2.csv")
+traits24 <- fungalTraits[fungalTraits$GENUS %in% rownames(life.res), c("GENUS", "primary_lifestyle")] 
+
+# Add abundancy information
+traits24 <- cbind(traits24, life.res[match(traits24$GENUS, rownames(life.res)), ])
+traits24$primary_lifestyle <- gsub("unspecified_", "", traits24$primary_lifestyle)
+traits24$primary_lifestyle <- gsub("_", " ", traits24$primary_lifestyle)
+traits24$primary_lifestyle <- as.factor(traits24$primary_lifestyle)
+
+# Select sampling site declined/healthy and sum
+# Add 1 to avoid -Inf in log transformation
+sampsite.list <- list()
+
+for (i in c("L", "V", "A", "C")) {
+  
+  for (j in c("D", "H")) {
+    
+    sampsite.tree <- traits24[, grep(paste0("T", i, j), colnames(traits24))] %>% rowsum(., group = traits24$primary_lifestyle) + 1
+    sampsite.soil <- traits24[, grep(paste0("S", i, j), colnames(traits24))] %>% rowsum(., group = traits24$primary_lifestyle) + 1
+    sampsite.list[[i]][[j]] <- list(Tree = sampsite.tree, Soil = sampsite.soil)
+    
+  }
+  
+}
+
+names(sampsite.list) <- c("Chestnut", "Cork oak", "Holm oak", "Pyrenean oak")
+
+
+
+```
+
+
+### Lollipop plot 
+
+```{r, fig.width=16, fig.height=12}
+
+# par(mfrow=c(2,2))
+
+png(filename=paste(folder, "figs/functional_lollipop_rel.png", sep=""), type="cairo",
+      units="in", width=16, height=12, pointsize=12,
+      res=300)
+
+layout(mat = matrix(c(1,2,3,4,5,5), nrow = 3, ncol = 2, byrow = TRUE), heights = c(6, 6, 0.5), widths = c(8,8))
+# par(cex = 1.8, mai = c(1.6, 0.3, 0.8, 0.1))
+
+for (i in c("Chestnut", "Cork oak", "Holm oak", "Pyrenean oak")) {
+  
+  # Extract data from list
+  sitesel <- sampsite.list[[i]]
+  absum.h <- sitesel$Healthy %>% log(., 2) %>% rowSums()
+  absum.h <- absum.h/sum(absum.h)
+  absum.d <- sitesel$Declined %>% log(., 2) %>% rowSums()
+  absum.d <- absum.d/sum(absum.d)
+  
+  # Order by diseased importance
+  absum.h <- absum.h[order(absum.d)]
+  absum.d <- absum.d[order(absum.d)]
+  numtraits <- length(absum.h)
+  
+  # Plot
+  par(mgp=c(2,1,0), mar=c(4, 10, 2, 1), cex = 1.2)
+  plot(rep(0, numtraits), 1:numtraits, xlim = c(0, max(c(absum.h, absum.d))), col = "white", yaxt = "n", 
+       ylab = "", xlab = "log2(abundance)", main = i)
+  # title(xlab="log2(abundance)", line=2, cex.lab=1.2)
+  axis(side = 2, at =  1:numtraits, labels = names(absum.h), las = 2)
+  segments(x0 = absum.d, y0 = 1:numtraits, x1 = absum.h, y1 = 1:numtraits)
+  points(absum.d, 1:numtraits, pch=19, col = "orange")
+  points(absum.h, 1:numtraits, pch=19, col = "purple")
+  
+  
+}
+
+# Plot legend at the bottom
+par(mai=c(0,0,0,0), cex = 1.5)
+plot.new()
+legend(x="center", ncol=2, bty = "n", legend=c("Declined", "Healthy"),
+       fill=c("orange","purple"))
+
+dev.off()
+
+```
+
+## For indicator genera
+
+```{r}
+fungalTraits <- read.csv("../FungalTraits 1.2_ver_16Dec_2020 - V.1.2.csv")
+onlyhel <- read.xlsx("venn_genera.xlsx", sheetIndex = 3)
+onlydis <- read.xlsx("venn_genera.xlsx", sheetIndex = 2)
+
+onlyhel.traits <- fungalTraits[fungalTraits$GENUS %in% as.vector(onlyhel$x), ]
+onlydis.traits <- fungalTraits[fungalTraits$GENUS %in% as.vector(onlydis$x), ]
+```
